@@ -51,6 +51,7 @@ const (
 	MaxChunkLengthFieldSize = binary.MaxVarintLen32
 	// ChunkEncodingSize defines the size of the chunk encoding part.
 	ChunkEncodingSize = 1
+	MaxSamplesInChunk = 120
 )
 
 // Meta holds information about a chunk of data.
@@ -256,11 +257,18 @@ func MergeOverlappingChunks(chks []Meta) ([]Meta, error) {
 		if c.MaxTime > nc.MaxTime {
 			nc.MaxTime = c.MaxTime
 		}
-		chk, err := MergeChunks(nc.Chunk, c.Chunk)
+		chk1, chk2, err := MergeChunks(nc.Chunk, c.Chunk)
 		if err != nil {
 			return nil, err
 		}
-		nc.Chunk = chk
+		if chk2 != nil {
+			nc.Chunk = chk1
+			newChks = append(newChks, *nc)
+			nc.Chunk = chk2
+
+		} else {
+			nc.Chunk = chk1
+		}
 	}
 
 	return newChks, nil
@@ -268,47 +276,76 @@ func MergeOverlappingChunks(chks []Meta) ([]Meta, error) {
 
 // MergeChunks vertically merges a and b, i.e., if there is any sample
 // with same timestamp in both a and b, the sample in a is discarded.
-func MergeChunks(a, b chunkenc.Chunk) (*chunkenc.XORChunk, error) {
+func MergeChunks(a, b chunkenc.Chunk) (*chunkenc.XORChunk, *chunkenc.XORChunk, error) {
 	newChunk := chunkenc.NewXORChunk()
+	var newChunkwithExtraSamples *chunkenc.XORChunk
+	numSamplesInMergedChunk := 0
 	app, err := newChunk.Appender()
+	extraSamplesApp, err := newChunkwithExtraSamples.Appender()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ait := a.Iterator(nil)
 	bit := b.Iterator(nil)
 	aok, bok := ait.Next(), bit.Next()
 	for aok && bok {
+		numSamplesInMergedChunk++
 		at, av := ait.At()
 		bt, bv := bit.At()
-		if at < bt {
-			app.Append(at, av)
-			aok = ait.Next()
-		} else if bt < at {
-			app.Append(bt, bv)
-			bok = bit.Next()
+		if numSamplesInMergedChunk > MaxSamplesInChunk {
+			if at < bt {
+				extraSamplesApp.Append(at, av)
+				aok = ait.Next()
+			} else if bt < at {
+				extraSamplesApp.Append(bt, bv)
+				bok = bit.Next()
+			} else {
+				extraSamplesApp.Append(bt, bv)
+				aok = ait.Next()
+				bok = bit.Next()
+			}
+			for aok {
+				at, av := ait.At()
+				extraSamplesApp.Append(at, av)
+				aok = ait.Next()
+			}
+			for bok {
+				bt, bv := bit.At()
+				extraSamplesApp.Append(bt, bv)
+				bok = bit.Next()
+			}
 		} else {
-			app.Append(bt, bv)
-			aok = ait.Next()
-			bok = bit.Next()
+			if at < bt {
+				app.Append(at, av)
+				aok = ait.Next()
+			} else if bt < at {
+				app.Append(bt, bv)
+				bok = bit.Next()
+			} else {
+				app.Append(bt, bv)
+				aok = ait.Next()
+				bok = bit.Next()
+			}
+			for aok {
+				at, av := ait.At()
+				app.Append(at, av)
+				aok = ait.Next()
+			}
+			for bok {
+				bt, bv := bit.At()
+				app.Append(bt, bv)
+				bok = bit.Next()
+			}
 		}
 	}
-	for aok {
-		at, av := ait.At()
-		app.Append(at, av)
-		aok = ait.Next()
-	}
-	for bok {
-		bt, bv := bit.At()
-		app.Append(bt, bv)
-		bok = bit.Next()
-	}
+
 	if ait.Err() != nil {
-		return nil, ait.Err()
+		return nil, nil, ait.Err()
 	}
 	if bit.Err() != nil {
-		return nil, bit.Err()
+		return nil, nil, bit.Err()
 	}
-	return newChunk, nil
+	return newChunk, newChunkwithExtraSamples, nil
 }
 
 // WriteChunks writes as many chunks as possible to the current segment,
