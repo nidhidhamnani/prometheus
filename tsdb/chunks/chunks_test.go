@@ -16,6 +16,7 @@ package chunks
 import (
 	"testing"
 
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/testutil"
 )
 
@@ -25,4 +26,72 @@ func TestReaderWithInvalidBuffer(t *testing.T) {
 
 	_, err := r.Chunk(0)
 	testutil.NotOk(t, err)
+}
+
+func TestMergedChunksUnder120Samples(t *testing.T) {
+	for _, tc := range []struct {
+		input    []Meta
+		expected []Meta
+	}{
+		{
+			input: []Meta{
+				Meta{MinTime: 1, MaxTime: 120},
+				Meta{MinTime: 110, MaxTime: 150},
+				Meta{MinTime: 160, MaxTime: 200},
+			},
+			expected: []Meta{
+				Meta{MinTime: 1, MaxTime: 120},
+				Meta{MinTime: 121, MaxTime: 150},
+				Meta{MinTime: 160, MaxTime: 200},
+			},
+		},
+		{
+			input: []Meta{
+				Meta{MinTime: 1, MaxTime: 120},
+				Meta{MinTime: 90, MaxTime: 200},
+				Meta{MinTime: 110, MaxTime: 150},
+			},
+			expected: []Meta{
+				Meta{MinTime: 1, MaxTime: 120},
+				Meta{MinTime: 121, MaxTime: 200},
+			},
+		},
+	} {
+		// Create chunks for the input.
+		for i, meta := range tc.input {
+			chk := chunkenc.NewXORChunk()
+			app, err := chk.Appender()
+			testutil.Ok(t, err)
+			for j := meta.MinTime; j <= meta.MaxTime; j++ {
+				app.Append(j, float64(j))
+			}
+			tc.input[i].Chunk = chk
+		}
+
+		// Create chunks for the expected.
+		for i, meta := range tc.expected {
+			chk := chunkenc.NewXORChunk()
+			app, err := chk.Appender()
+			testutil.Ok(t, err)
+			for j := meta.MinTime; j <= meta.MaxTime; j++ {
+				app.Append(j, float64(j))
+			}
+			tc.expected[i].Chunk = chk
+		}
+
+		// Test the merging.
+		value, err := MergeOverlappingChunks(tc.input)
+		testutil.Ok(t, err)
+
+		testutil.Equals(t, len(tc.expected), len(value))
+
+		for i := range tc.expected {
+			exp := tc.expected[i]
+			act := value[i]
+			testutil.Equals(t, exp.MinTime, act.MinTime)
+			testutil.Equals(t, exp.MaxTime, act.MaxTime)
+			testutil.Equals(t, exp.Chunk.Bytes(), act.Chunk.Bytes())
+
+		}
+	}
 }

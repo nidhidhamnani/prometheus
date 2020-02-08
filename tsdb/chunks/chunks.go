@@ -22,6 +22,7 @@ import (
 	"hash/crc32"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -257,17 +258,14 @@ func MergeOverlappingChunks(chks []Meta) ([]Meta, error) {
 		if c.MaxTime > nc.MaxTime {
 			nc.MaxTime = c.MaxTime
 		}
-		chk1, chk2, err := MergeChunks(nc.Chunk, c.Chunk)
+		metaA, metaB, err := MergeChunks(*nc, c)
 		if err != nil {
 			return nil, err
 		}
-		if chk2 != nil {
-			nc.Chunk = chk1
-			newChks = append(newChks, *nc)
-			nc.Chunk = chk2
-
-		} else {
-			nc.Chunk = chk1
+		newChks[last] = *metaA
+		if metaB != nil {
+			newChks = append(newChks, *metaB)
+			last++
 		}
 	}
 
@@ -276,67 +274,80 @@ func MergeOverlappingChunks(chks []Meta) ([]Meta, error) {
 
 // MergeChunks vertically merges a and b, i.e., if there is any sample
 // with same timestamp in both a and b, the sample in a is discarded.
-func MergeChunks(a, b chunkenc.Chunk) (*chunkenc.XORChunk, *chunkenc.XORChunk, error) {
+func MergeChunks(a, b Meta) (*Meta, *Meta, error) {
 	newChunk := chunkenc.NewXORChunk()
 	var newChunkwithExtraSamples *chunkenc.XORChunk
 	numSamplesInMergedChunk := 0
 	app, err := newChunk.Appender()
-	extraSamplesApp, err := newChunkwithExtraSamples.Appender()
 	if err != nil {
 		return nil, nil, err
 	}
-	ait := a.Iterator(nil)
-	bit := b.Iterator(nil)
+	metaA := &Meta{
+		MinTime: int64(math.Min(float64(a.MinTime), float64(b.MinTime))),
+		MaxTime: int64(math.Max(float64(a.MaxTime), float64(b.MaxTime))),
+		Chunk:   newChunk,
+	}
+	var metaB *Meta
+
+	ait := a.Chunk.Iterator(nil)
+	bit := b.Chunk.Iterator(nil)
 	aok, bok := ait.Next(), bit.Next()
-	for aok && bok {
-		numSamplesInMergedChunk++
-		at, av := ait.At()
-		bt, bv := bit.At()
-		if numSamplesInMergedChunk > MaxSamplesInChunk {
-			if at < bt {
-				extraSamplesApp.Append(at, av)
-				aok = ait.Next()
-			} else if bt < at {
-				extraSamplesApp.Append(bt, bv)
-				bok = bit.Next()
-			} else {
-				extraSamplesApp.Append(bt, bv)
-				aok = ait.Next()
-				bok = bit.Next()
-			}
-			for aok {
-				at, av := ait.At()
-				extraSamplesApp.Append(at, av)
-				aok = ait.Next()
-			}
-			for bok {
-				bt, bv := bit.At()
-				extraSamplesApp.Append(bt, bv)
-				bok = bit.Next()
-			}
-		} else {
-			if at < bt {
-				app.Append(at, av)
-				aok = ait.Next()
-			} else if bt < at {
-				app.Append(bt, bv)
-				bok = bit.Next()
-			} else {
-				app.Append(bt, bv)
-				aok = ait.Next()
-				bok = bit.Next()
-			}
-			for aok {
-				at, av := ait.At()
-				app.Append(at, av)
-				aok = ait.Next()
-			}
-			for bok {
-				bt, bv := bit.At()
-				app.Append(bt, bv)
-				bok = bit.Next()
+	var lastSampleT int64
+
+	calculateMinTime := func(t1 int64, t2 int64) int64 {
+		return int64(math.Min(float64(t1), float64(t2)))
+	}
+
+	intializeNewChunkWithExtraSamples := func(minTime int64) {
+		if numSamplesInMergedChunk >= MaxSamplesInChunk && metaB == nil {
+			metaA.MaxTime = lastSampleT
+			newChunkwithExtraSamples = chunkenc.NewXORChunk()
+			app, err = newChunkwithExtraSamples.Appender()
+			metaB = &Meta{
+				MinTime: minTime,
+				MaxTime: int64(math.Max(float64(a.MaxTime), float64(b.MaxTime))),
+				Chunk:   newChunkwithExtraSamples,
 			}
 		}
+	}
+
+	for aok && bok {
+		at, av := ait.At()
+		bt, bv := bit.At()
+
+		intializeNewChunkWithExtraSamples(calculateMinTime(at, bt))
+
+		if at < bt {
+			app.Append(at, av)
+			lastSampleT = at
+			aok = ait.Next()
+		} else if bt < at {
+			app.Append(bt, bv)
+			lastSampleT = bt
+			bok = bit.Next()
+		} else {
+			app.Append(bt, bv)
+			lastSampleT = bt
+			aok = ait.Next()
+			bok = bit.Next()
+		}
+		numSamplesInMergedChunk++
+	}
+	for aok {
+		at, av := ait.At()
+		intializeNewChunkWithExtraSamples(at)
+		app.Append(at, av)
+		lastSampleT = at
+		aok = ait.Next()
+		numSamplesInMergedChunk++
+	}
+	for bok {
+		bt, bv := bit.At()
+		intializeNewChunkWithExtraSamples(bt)
+		app.Append(bt, bv)
+		lastSampleT = bt
+		bok = bit.Next()
+		numSamplesInMergedChunk++
 	}
 
 	if ait.Err() != nil {
@@ -345,7 +356,7 @@ func MergeChunks(a, b chunkenc.Chunk) (*chunkenc.XORChunk, *chunkenc.XORChunk, e
 	if bit.Err() != nil {
 		return nil, nil, bit.Err()
 	}
-	return newChunk, newChunkwithExtraSamples, nil
+	return metaA, metaB, nil
 }
 
 // WriteChunks writes as many chunks as possible to the current segment,
